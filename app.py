@@ -98,9 +98,48 @@ SS_SERVER_KEY = os.environ.get("VEGA_SS_SERVER_KEY") or _ss_b64key("vega-ss-serv
 XRAY_API_PORT = 10085
 FLASK_PORT = 5000
 
-DB_PATH = "users.db"
-XRAY_CONFIG_PATH = "xray_config.json"
-NGINX_CONFIG_PATH = "nginx.conf"
+# پورت‌هایی که داخل کانتینر توسط Xray/Flask گرفته می‌شوند؛ nginx هرگز نباید روی
+# یکی از این‌ها بنشیند. اگر پلتفرم (مثلاً Railway با target port اشتباه) PORT را روی
+# یکی از این‌ها بگذارد، به‌جای کرش کردن، پورت امن استفاده می‌شود.
+_INTERNAL_PORTS = {FLASK_PORT, XRAY_PORT, TROJAN_PORT, VMESS_PORT, SS_PORT, XRAY_API_PORT}
+
+
+def _env_port(name, default):
+    raw = (os.environ.get(name) or "").strip()
+    return int(raw) if raw.isdigit() and 0 < int(raw) < 65536 else default
+
+
+PUBLIC_PORT = _env_port("PORT", 8080)
+if PUBLIC_PORT in _INTERNAL_PORTS:
+    print(
+        f"[vega] هشدار: PORT={PUBLIC_PORT} با یکی از پورت‌های داخلی Xray/Flask تداخل دارد "
+        f"→ پنل روی 8080 بالا می‌آید. در پنل پلتفرم، target port دامنه را اصلاح کن.",
+        flush=True,
+    )
+    PUBLIC_PORT = 8080
+
+if SS_PORT == PUBLIC_PORT:
+    SS_PORT = 10013
+
+# همهٔ فایل‌های وضعیت (دیتابیس، کانفیگ Xray، nginx) در یک پوشه نگه‌داری می‌شوند.
+# روی PaaS یک volume را روی همین پوشه mount کنید و VEGA_DATA_DIR را ست کنید:
+#   VEGA_DATA_DIR=/app/data
+DATA_DIR = os.environ.get("VEGA_DATA_DIR", ".").strip() or "."
+
+try:
+    if DATA_DIR not in (".", ""):
+        os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    pass
+
+
+def _data_file(name):
+    return name if DATA_DIR in (".", "") else os.path.join(DATA_DIR, name)
+
+
+DB_PATH = _data_file("users.db")
+XRAY_CONFIG_PATH = _data_file("xray_config.json")
+NGINX_CONFIG_PATH = _data_file("nginx.conf")
 
 ONLINE_USERS = {}
 ONLINE_THRESHOLD = 90
@@ -709,8 +748,17 @@ def start_stats_collector():
     t = threading.Thread(target=stats_collector, daemon=True)
     t.start()
 
+def _port_open(port, host="127.0.0.1", timeout=0.6):
+    """آیا روی این پورت چیزی گوش می‌دهد؟"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 def start_nginx():
-    port = os.environ.get("PORT", "8080")
+    port = PUBLIC_PORT
 
     nginx_conf = f"""
 pid /run/nginx.pid;
@@ -784,19 +832,37 @@ http {{
     with open(NGINX_CONFIG_PATH, "w", encoding="utf-8") as f:
         f.write(nginx_conf)
 
+    nginx_bin = shutil.which("nginx")
+    if not nginx_bin:
+        print("[vega] nginx پیدا نشد → پنل مستقیم روی PORT اجرا می‌شود "
+              "(کانفیگ‌های WS/TLS در این حالت کار نمی‌کنند)", flush=True)
+        return False
+
     try:
         subprocess.run(["pkill", "-9", "-f", "nginx"], check=False)
         time.sleep(0.3)
     except Exception:
         pass
 
-    subprocess.Popen([
-        "nginx",
-        "-c",
-        os.path.abspath(NGINX_CONFIG_PATH),
-        "-g",
-        "daemon off;"
-    ])
+    try:
+        subprocess.Popen(
+            [nginx_bin, "-c", os.path.abspath(NGINX_CONFIG_PATH), "-g", "daemon off;"],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+    except Exception as e:
+        print(f"[vega] اجرای nginx ناموفق بود: {e}", flush=True)
+        return False
+
+    # مطمئن شو پورت واقعاً باز شده؛ وگرنه پلتفرم سرویس را «بالا نیامده» می‌بیند
+    for _ in range(20):
+        time.sleep(0.5)
+        if _port_open(int(port)):
+            print(f"[vega] nginx روی پورت {port} بالا آمد", flush=True)
+            return True
+
+    print(f"[vega] nginx بالا آمد ولی پورت {port} باز نشد — پنل مستقیم اجرا می‌شود", flush=True)
+    return False
 
 def _enc(value):
     return urllib.parse.quote(str(value), safe="")
@@ -1218,6 +1284,23 @@ def home():
     if "admin" not in session:
         return redirect(url_for("login"))
     return redirect(url_for("dashboard"))
+
+@app.route("/healthz")
+def healthz():
+    """چک سریع سلامت برای پلتفرم‌ها و عیب‌یابی دستی."""
+    return jsonify({
+        "status": "ok",
+        "brand": BRAND,
+        "port": PUBLIC_PORT,
+        "env_port": os.environ.get("PORT", ""),
+        "data_dir": os.path.abspath(DATA_DIR),
+        "db": os.path.abspath(DB_PATH),
+        "xray_bin": shutil.which("xray") or "/usr/local/bin/xray/xray",
+        "nginx_bin": shutil.which("nginx") or "",
+        "ss_enabled": SS_ENABLED,
+        "ss_port": SS_PORT,
+    })
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -2180,10 +2263,37 @@ def start_telegram_bot():
     t = threading.Thread(target=run_telegram_bot_thread, daemon=True)
     t.start()
 
+def main():
+    public_port = PUBLIC_PORT
+
+    print(f"[vega] شروع: PORT={public_port} DATA_DIR={os.path.abspath(DATA_DIR)} "
+          f"ss={'on' if SS_ENABLED else 'off'}:{SS_PORT}", flush=True)
+
+    for step, fn in (
+        ("init_db", init_db),
+        ("restart_xray", restart_xray),
+        ("stats_collector", start_stats_collector),
+        ("telegram_bot", start_telegram_bot),
+    ):
+        try:
+            fn()
+        except Exception as e:
+            print(f"[vega] {step} با خطا متوقف شد: {e}", flush=True)
+
+    try:
+        nginx_ok = start_nginx()
+    except Exception as e:
+        print(f"[vega] start_nginx با خطا متوقف شد: {e}", flush=True)
+        nginx_ok = False
+
+    if nginx_ok:
+        # nginx ترافیک را روی PORT می‌گیرد و Flask پشتش روی 127.0.0.1 است
+        app.run(host="127.0.0.1", port=FLASK_PORT, threaded=True)
+    else:
+        # بدون nginx: خودِ Flask روی PORT عمومی می‌نشیند تا پنل بالا بیاید
+        print(f"[vega] Flask مستقیم روی 0.0.0.0:{public_port}", flush=True)
+        app.run(host="0.0.0.0", port=public_port, threaded=True)
+
+
 if __name__ == "__main__":
-    init_db()
-    restart_xray()
-    start_nginx()
-    start_stats_collector()
-    start_telegram_bot()
-    app.run(host="127.0.0.1", port=FLASK_PORT)
+    main()
